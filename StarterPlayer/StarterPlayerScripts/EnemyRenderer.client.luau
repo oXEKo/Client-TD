@@ -1,30 +1,16 @@
--- oXEKo | o0xek0o
--- 326 lines of code
+--[[
+	Script by oXEKo | o0xek0o (roblox)
+	328 lines of code
+	Client script: spawning, rendering, animation and enemy movement
+]]
 
--- EnemyRenderer — client LocalScript responsible for spawning, animating,
--- and destroying all enemy models during waves. The server never touches
--- visual state; this script derives every position from a shared path
--- formula so the server needs zero per-frame replication writes.
--- Components: Enemy OOP class (metatables), path math (CFrame), FPS
--- adaptation, a time-ordered spawn queue, and attribute-driven status FX.
-
--- Services used throughout this script.
--- RunService.Heartbeat fires every frame — used for movement and spawn drain.
--- TweenService produces smooth HP-bar transitions instead of instant jumps.
+-- Services
 local RunService        = game:GetService("RunService")
 local TweenService      = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players           = game:GetService("Players")
 
--- Shared modules from ReplicatedStorage, accessible on both client and server.
--- EnemyConfig  : wave definitions and per-enemy stat tables.
--- PathUtils    : loads waypoint data and maps a distance scalar to a
---                world-space Vector3 position + direction along the path.
--- Config       : global client settings (FPS thresholds, shadow toggle).
--- ModelUtils   : clones a character template, strips the default Animate
---                script, and applies common BasePart flags in one call.
--- EnemyRegistry: shared in-memory table of alive enemies; fires onCleared
---                when the last enemy is removed (used for wave end detection).
+-- Modules
 local Modules       = ReplicatedStorage:WaitForChild("Modules")
 local Config        = require(Modules:WaitForChild("EnemyConfig"))
 local PathUtils     = require(Modules:WaitForChild("PathUtils"))
@@ -32,53 +18,38 @@ local ClientConfig  = require(Modules:WaitForChild("Config"))
 local ModelUtils    = require(Modules:WaitForChild("ModelUtils"))
 local EnemyRegistry = require(Modules:WaitForChild("EnemyRegistry"))
 
--- Remote events fired by the server to drive wave lifecycle on all clients.
+-- Events
 local Events      = ReplicatedStorage:WaitForChild("Events")
 local WaveStarted = Events:WaitForChild("WaveStarted")
 local AllReady    = Events:WaitForChild("AllReady")
 
--- Source folder for enemy model templates and the live container in Workspace.
--- We wait for child "1" before loading the path to guarantee waypoints exist.
+-- Path and path data
 local EnemiesSrc  = ReplicatedStorage:WaitForChild("Enemies")
 local EnemyFolder = workspace:WaitForChild("Enemies")
 local pathFolder  = workspace:WaitForChild("Path") :: Folder
 pathFolder:WaitForChild("1")
 local pathData    = PathUtils.load(pathFolder)
 
--- GUI references are re-fetched on every character respawn because ScreenGui
--- resets when the character respawns (ResetOnSpawn = true). Holding stale
--- references after respawn would silently stop all label updates with no error.
+-- LocalPlayer and PlayerGui
 local localPlayer = Players.LocalPlayer
 local playerGui   = localPlayer:WaitForChild("PlayerGui")
 
-local waveLabel, countLabel, timerLabel
+-- GUI references
+local screenGui = playerGui:WaitForChild("ScreenGui")
+local upperGui  = screenGui:WaitForChild("Upper Gui")
+local waveLabel  = upperGui:WaitForChild("Wave number")
+local countLabel = upperGui:WaitForChild("Enemy Count")
+local timerLabel = upperGui:WaitForChild("Timer")
 
-local function fetchGuiRefs()
-	local screenGui = playerGui:WaitForChild("ScreenGui")
-	local upperGui  = screenGui:WaitForChild("Upper Gui")
-	waveLabel  = upperGui:WaitForChild("Wave number")
-	countLabel = upperGui:WaitForChild("Enemy Count")
-	timerLabel = upperGui:WaitForChild("Timer")
-end
-
-fetchGuiRefs()
-localPlayer.CharacterAdded:Connect(fetchGuiRefs)
-
--- TOTAL_WAVES computed once so the wave label can display "Wave X / N".
--- HP_BAR_TWEEN defines easing for health bar shrink — Quad Out feels snappy.
--- MAX_SPAWNS_PER_FRAME caps instantiation per Heartbeat tick, preventing a
--- frame spike when many enemies share the exact same spawn timestamp.
+-- Constants
 local TOTAL_WAVES: number          = #Config.WAVES
 local HP_BAR_TWEEN: TweenInfo      = TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local WALK_ANIM_ID: string         = "rbxassetid://913402848"
 local MAX_SPAWNS_PER_FRAME: number = 5
+local FPS_LOW: number              = ClientConfig.FPS_LOW
+local FPS_HIGH: number             = ClientConfig.FPS_HIGH
 
--- avgFps is an exponential moving average (EMA) of instantaneous frame rate.
--- Formula each frame:  avgFps = avgFps * 0.9 + currentFps * 0.1
--- The 0.9 weight on history smooths transient spikes so shadow toggling
--- stays stable and does not oscillate rapidly around the threshold.
--- spawnQueue is time-sorted; spawnQueueHead is a forward-only pointer.
--- Advancing it is O(1) and avoids the O(n) cost of table.remove per frame.
+-- Runtime state
 local avgFps: number      = ClientConfig.AVG_FPS_INIT
 local shadowsOn: boolean  = ClientConfig.SHADOWS_ON
 local waveActive: boolean = false
@@ -86,63 +57,65 @@ local spawnQueue: { { id: number, enemyType: string, spawnTime: number } } = {}
 local spawnQueueHead: number = 1
 local startCountdown: (seconds: number, prefix: string) -> ()
 
--- Enemy IDs encode the originating wave and spawn index into one integer:
---   id = waveNum * 10000 + index   (boss always uses index 9999)
--- Any system can recover which wave an enemy belongs to from the id alone.
+-- Get Enemy ID based on wave number and index
 local function getEnemyId(waveNum: number, index: number): number
 	return waveNum * 10000 + index
 end
 
+-- 9999 is reserved for the boss slot
 local function getBossId(waveNum: number): number
 	return waveNum * 10000 + 9999
 end
 
--- Calculates the boss spawn offset (seconds after wave start).
--- trigger == "delay": use the explicit delay value from config.
--- Otherwise: simulate every regular enemy's travel time and spawn the boss
--- 1 second after the last one would reach the end, so the boss always
--- arrives after the regular wave has cleared.
+-- how many seconds after wave start the boss spawns (must be after the last enemy finishes the path)
 local function getBossSpawnOffset(waveConfig: { any }): number?
 	local boss = waveConfig.boss
 	if not boss then return nil end
+	-- if trigger is "delay", just use a fixed offset
 	if boss.trigger == "delay" then return boss.delay end
+
 	local maxEndTime: number = 0
 	local offset: number     = 0
+
 	for _, batch in waveConfig do
+		-- waveConfig has a "boss" key and others; batches are identified by having a count field
 		if type(batch) ~= "table" or not batch.count then continue end
+
 		for i = 1, batch.count do
+			-- spawn offset + time for enemy to walk the full path = arrival time for this enemy
 			local endT = offset + (i - 1) * batch.interval
 				+ pathData.totalLength / Config.ENEMY_TYPES[batch.type].speed
+
 			if endT > maxEndTime then maxEndTime = endT end
 		end
+		-- track where the next batch starts
 		offset += batch.count * batch.interval
 	end
+
+	-- +1 so the last enemy fully exits the path
 	return maxEndTime + 1
 end
 
--- Appends a future spawn entry. Heartbeat drains this queue in time order,
--- creating enemy instances at the correct server-synchronized moment.
+-- adds an enemy with parameters to spawnQueue for later spawning
 local function queueEnemy(id: number, enemyType: string, spawnTime: number): ()
 	spawnQueue[#spawnQueue + 1] = { id = id, enemyType = enemyType, spawnTime = spawnTime }
 end
 
+-- updates the enemy count label in the GUI
 local function updateCountLabel(): ()
 	countLabel.Text = `Enemies: {EnemyRegistry.count()}`
 end
 
--- Toggles CastShadow on every BasePart of the enemy model.
--- Called globally when the FPS EMA crosses a threshold, shedding shadow
--- draw calls across all enemies at once to recover frame budget.
+-- Enables or disables shadows on all enemy model parts based on the enabled parameter (depends on FPS)
 local function setEnemyShadows(enemy: any, enabled: boolean): ()
 	for _, part in enemy.model:GetDescendants() do
+		-- skip non-BasePart objects to avoid errors when setting CastShadow
 		if not part:IsA("BasePart") then continue end
 		(part :: BasePart).CastShadow = enabled
 	end
 end
 
--- Destroys all live models and resets the spawn queue before a new wave.
--- Stopping the walk animation before Destroy prevents the Animator from
--- firing callbacks on an already-destroyed model instance.
+-- full reset before a new wave -- also removes any remaining enemies from the previous wave (just in case)
 local function cleanupAllEnemies(): ()
 	for _, enemy in EnemyRegistry.all() do
 		if enemy.isAlive then
@@ -156,11 +129,11 @@ local function cleanupAllEnemies(): ()
 	countLabel.Text = "Enemies: 0"
 end
 
--- Runs a countdown in a separate thread so it does not block the caller.
--- Exits early if waveActive flips true mid-countdown (next wave arrived).
+-- Async countdown timer so it doesn't block the rest of the code
 startCountdown = function(seconds: number, prefix: string): ()
 	task.spawn(function()
 		for i = seconds, 1, -1 do
+			-- if the wave started during countdown, exit early
 			if waveActive then
 				timerLabel.Text = ""
 				return
@@ -172,9 +145,7 @@ startCountdown = function(seconds: number, prefix: string): ()
 	end)
 end
 
--- onCleared fires when the last enemy is removed from EnemyRegistry.
--- We only start the between-wave countdown when the spawn queue is also
--- exhausted — otherwise enemies are still queued but not yet instantiated.
+-- fires when the last enemy dies AND the queue is empty -- wave complete
 EnemyRegistry.onCleared:Connect(function()
 	if waveActive and spawnQueueHead > #spawnQueue then
 		waveActive = false
@@ -182,17 +153,11 @@ EnemyRegistry.onCleared:Connect(function()
 	end
 end)
 
--- Enemy class implemented with Luau metatables for lightweight OOP.
--- __index = Enemy means any method lookup on an instance falls through to
--- the class table, so all instances share one method table without copying
--- functions into each individual object (memory efficient).
+-- Enemy class with metatables: all instances share methods via __index
 local Enemy = {}
 Enemy.__index = Enemy
 
--- Constructor: initialises state, clones the model via ModelUtils, sets up
--- an AnimationController + Animator pair (required for non-Humanoid rigs —
--- a Humanoid has its own built-in Animator), then positions the model at the
--- correct path offset accounting for server-to-client spawn latency.
+-- creates and returns an Enemy instance (clones the model, sets up animation + HP bar, syncs position on the path via server time)
 function Enemy.new(id: number, enemyType: string, spawnTime: number): any
 	local self  = setmetatable({}, Enemy)
 	local stats = Config.ENEMY_TYPES[enemyType]
@@ -204,15 +169,15 @@ function Enemy.new(id: number, enemyType: string, spawnTime: number): any
 	self.hp        = stats.maxHp
 	self.spawnTime = spawnTime
 	self.isAlive   = true
-	-- slowDebt accumulates the distance-equivalent already saved during past
-	-- slow windows so the position formula stays continuous when a slow ends.
 	self.slowDebt  = 0
 	self.wasSlowed = false
 	self.slowStart = 0
 	self.curFactor = 1
+	self.bleeding  = false
 	self.bleedBox  = nil
 	self.iceBlock  = nil
 
+	-- Clone the model template
 	local template   = EnemiesSrc:FindFirstChild(enemyType) :: Instance
 	local model, hrp = ModelUtils.cloneAndPrepare(template, {
 		castShadow = shadowsOn,
@@ -223,8 +188,7 @@ function Enemy.new(id: number, enemyType: string, spawnTime: number): any
 	self.model   = model
 	self.hrp     = hrp
 
-	-- AnimationController + Animator is the correct pair for non-Humanoid
-	-- rigs. Without AnimationController the Animator has no root to bind to.
+	-- Walk animation
 	local animController  = Instance.new("AnimationController")
 	animController.Parent = model
 	local animator        = Instance.new("Animator")
@@ -232,18 +196,17 @@ function Enemy.new(id: number, enemyType: string, spawnTime: number): any
 	self.walkTrack        = ModelUtils.makeAnimTrack(animator, WALK_ANIM_ID)
 	self.walkTrack:Play()
 
-	-- Compute how far the enemy has already traveled between its server
-	-- spawnTime and the moment this client instantiates it (latency + queue).
-	-- CFrame.lookAt builds a rotation with +Z toward the path direction,
-	-- giving the enemy the correct facing immediately on first placement.
+	-- use server time so a late spawn is synced with other clients and the server
 	local now0     = workspace:GetServerTimeNow()
 	local initDist = math.max(0, (now0 - spawnTime) * stats.speed)
 	local initPos, initDir = PathUtils.getPosition(pathData, initDist)
+	-- check if the enemy already finished the path by spawn time; if so, place at the first waypoint, otherwise use the calculated position
 	self.smoothCF = initPos
 		and CFrame.lookAt(initPos, initPos + (initDir or Vector3.new(0, 0, 1)))
 		or  CFrame.new(pathData.waypoints[1])
 	model:PivotTo(self.smoothCF)
 
+	-- Find the BillboardGui and set it up
 	local billboard = model:FindFirstChildOfClass("BillboardGui")
 	if billboard then
 		self.nameLabel   = billboard:FindFirstChild("Name")
@@ -255,30 +218,26 @@ function Enemy.new(id: number, enemyType: string, spawnTime: number): any
 		if self.filledBar   then self.filledBar.Size   = UDim2.new(0.96, 0, 0.8, 0) end
 	end
 
+	-- register the enemy in the global registry so other code can find it by id, then update the enemy count
 	EnemyRegistry.add(id, self)
 	updateCountLabel()
 	return self
 end
 
--- Computes actual distance traveled along the path at time `now`.
--- Base formula:  dist = (now - spawnTime) * speed
--- slowDebt   : total distance-time saved by all previously ended slows.
--- curOffset  : distance-time currently being saved by the active slow.
--- math.max(0) prevents a negative result at the moment of spawning.
+-- get distance traveled (elapsed time * speed, minus slow debt and current slow offset)
 function Enemy:_distance(now: number): number
 	local curOffset = self.wasSlowed
 		and (1 - self.curFactor) * self.speed * (now - self.slowStart) or 0
 	return math.max(0, (now - self.spawnTime) * self.speed - self.slowDebt - curOffset)
 end
 
--- Returns 0–1 normalized progress along the path.
--- Used by UnitRenderer targeting comparators ("first" = max, "last" = min).
+-- get path progress, where 0 = 0% and 1 = 100%
 function Enemy:GetProgress(): number
 	local dist = self:_distance(workspace:GetServerTimeNow())
 	return math.clamp(dist / pathData.totalLength, 0, 1)
 end
 
--- Animates the HP bar via TweenService for smooth visual feedback on hits.
+-- Update the health bar with a tween, and update the health label text if present
 function Enemy:UpdateHpBar(): ()
 	local ratio = math.clamp(self.hp / self.maxHp, 0, 1)
 	if self.filledBar then
@@ -291,8 +250,7 @@ function Enemy:UpdateHpBar(): ()
 	end
 end
 
--- Applies damage, refreshes the HP bar, and calls Destroy when HP hits 0.
--- isAlive guard prevents double-processing on a dying enemy in the same frame.
+-- deals damage, calls Destroy if hp drops to zero
 function Enemy:TakeDamage(amount: number): ()
 	if not self.isAlive then return end
 	self.hp = math.max(0, self.hp - amount)
@@ -300,53 +258,56 @@ function Enemy:TakeDamage(amount: number): ()
 	if self.hp <= 0 then self:Destroy() end
 end
 
--- Reads "Slowed" and "SlowFactor" marker attributes set by the server to
--- show or hide the slow/stun block visual.
--- factor == 0  →  full stun: yellow SmoothPlastic block.
--- factor > 0   →  partial slow: blue Ice material block.
--- On slow-end we commit the saved distance into slowDebt so _distance stays
--- continuous — without this the enemy would visually jump forward.
-function Enemy:_handleSlow(now: number, marker: Instance?): ()
-	local isSlowed = marker ~= nil and marker:GetAttribute("Slowed") == true
-	local factor: number = 1
-	if isSlowed then
-		local f = marker:GetAttribute("SlowFactor")
-		if type(f) == "number" then factor = f end
-	end
-	if isSlowed and not self.wasSlowed then
-		self.slowStart = now
-		self.curFactor = factor
-		self.wasSlowed = true
-		if not self.iceBlock then
-			local ice        = Instance.new("Part")
-			ice.Size         = Vector3.new(2.2, 2.2, 2.2)
-			ice.Material     = factor == 0 and Enum.Material.SmoothPlastic or Enum.Material.Ice
-			ice.Color        = factor == 0
-				and Color3.fromRGB(255, 230, 50)
-				or  Color3.fromRGB(100, 210, 255)
-			ice.Transparency = 0.3
-			ice.CanCollide   = false
-			ice.CanQuery     = false
-			ice.CanTouch     = false
-			ice.CastShadow   = false
-			ice.Anchored     = true
-			ice.CFrame       = self.hrp.CFrame
-			ice.Parent       = self.model
-			self.iceBlock    = ice
-		end
-	elseif not isSlowed and self.wasSlowed then
+-- manages the ice block and slowDebt: factor 0 = stun (yellow), otherwise slow (blue ice)
+-- slowDebt accumulates distance lost while slowed so the enemy doesn't jump forward when the effect ends
+function Enemy:ApplySlow(factor: number, duration: number): ()
+	if not self.isAlive then return end
+	if type(factor) ~= "number" or type(duration) ~= "number" then return end
+	local now = workspace:GetServerTimeNow()
+	-- accumulate distance lost while slowed so the enemy doesn't jump forward
+	if self.wasSlowed then
 		self.slowDebt += (1 - self.curFactor) * self.speed * (now - self.slowStart)
+	end
+	self.curFactor = factor
+	self.slowStart = now
+	self.wasSlowed = true
+	local startToken = now
+
+	if self.iceBlock then self.iceBlock:Destroy() end
+	local ice        = Instance.new("Part")
+	ice.Size         = Vector3.new(2.2, 2.2, 2.2)
+	-- factor 0 = stun (yellow plastic), otherwise slow (blue ice)
+	ice.Material     = factor == 0 and Enum.Material.SmoothPlastic or Enum.Material.Ice
+	ice.Color        = factor == 0
+		and Color3.fromRGB(255, 230, 50)
+		or  Color3.fromRGB(100, 210, 255)
+	ice.Transparency = 0.3
+	ice.CanCollide   = false
+	ice.CanQuery     = false
+	ice.CanTouch     = false
+	ice.CastShadow   = false
+	ice.Anchored     = true
+	ice.CFrame       = self.hrp.CFrame
+	ice.Parent       = self.model
+	self.iceBlock    = ice
+
+	-- after duration expires, remove the slow effect, but only if the enemy is still alive and hasn't received a new slow (that's why we check slowStart)
+	task.delay(duration, function()
+		if not self.isAlive or not self.wasSlowed or self.slowStart ~= startToken then return end
+		self.slowDebt += (1 - self.curFactor) * self.speed
+			* (workspace:GetServerTimeNow() - self.slowStart)
 		self.wasSlowed = false
 		if self.iceBlock then self.iceBlock:Destroy(); self.iceBlock = nil end
-	end
+	end)
 end
 
--- Reads the "Bleeding" attribute to toggle a SelectionBox adornment.
--- SelectionBox draws a colored wireframe around the whole model with no
--- mesh or texture changes — a built-in Roblox API decoration object.
-function Enemy:_handleBleed(marker: Instance?): ()
-	local isBleeding = marker ~= nil and marker:GetAttribute("Bleeding") == true
-	if isBleeding and not self.bleedBox then
+-- red SelectionBox during bleed + damage tick on the client, bleeding flag prevents stacking
+function Enemy:ApplyBleed(damage: number, duration: number, tickRate: number): ()
+	if not self.isAlive or self.bleeding then return end
+	if type(damage) ~= "number" or type(duration) ~= "number"
+		or type(tickRate) ~= "number" or tickRate <= 0 then return end
+	self.bleeding = true
+	if not self.bleedBox then
 		local box               = Instance.new("SelectionBox")
 		box.Color3              = Color3.fromRGB(200, 0, 0)
 		box.LineThickness       = 0.06
@@ -355,51 +316,48 @@ function Enemy:_handleBleed(marker: Instance?): ()
 		box.Adornee             = self.model
 		box.Parent              = workspace
 		self.bleedBox           = box
-	elseif not isBleeding and self.bleedBox then
-		self.bleedBox:Destroy()
-		self.bleedBox = nil
 	end
+	-- end time is calculated using server time so the effect is synced for all clients
+	local endTime = workspace:GetServerTimeNow() + duration
+	-- async damage timer so it doesn't block the main thread
+	task.spawn(function()
+		-- check isAlive to avoid damaging a dead enemy, and check time to stop the effect after duration expires
+		while self.isAlive and workspace:GetServerTimeNow() < endTime do
+			self:TakeDamage(damage)
+			task.wait(tickRate)
+		end
+		self.bleeding = false
+		-- remove the bleed visual effect
+		if self.bleedBox then self.bleedBox:Destroy(); self.bleedBox = nil end
+	end)
 end
 
--- Per-frame movement using three CFrame techniques combined:
--- 1. CFrame.lookAt    — builds a rotation with +Z facing the path direction.
--- 2. :Lerp            — interpolates smoothCF toward the target at dt*8 rate,
---                       producing momentum-like rotation smoothing each frame.
--- 3. CFrame.fromMatrix — reconstructs the CFrame from lerped axis vectors
---                        while snapping position exactly to the path point,
---                        preventing accumulated floating-point drift over time.
--- Returns false when PathUtils returns nil position (enemy passed path end).
+-- update enemy position and rotation along the path
 function Enemy:_updateMovement(now: number, dt: number): boolean
 	local dist     = self:_distance(now)
 	local pos, dir = PathUtils.getPosition(pathData, dist)
 	if not pos then return false end
 	local targetCF = CFrame.lookAt(pos, pos + dir)
+	-- lerp smooths rotation every frame so turns aren't snappy
 	self.smoothCF  = self.smoothCF:Lerp(targetCF, math.min(1, dt * 8))
 	self.smoothCF  = CFrame.new(pos) * CFrame.fromMatrix(
 		Vector3.zero, self.smoothCF.RightVector, self.smoothCF.UpVector, -self.smoothCF.LookVector)
 	self.model:PivotTo(self.smoothCF)
+	-- if there's an ice block, sync its position with the enemy
 	if self.iceBlock and self.iceBlock.Parent then
 		self.iceBlock.CFrame = self.hrp.CFrame
 	end
 	return true
 end
 
--- Per-frame dispatch. Order is intentional: slow before movement so
--- _distance uses the correct curFactor; bleed last as it is purely visual.
+-- update enemy position, call Destroy if the enemy reached the end of the path
 function Enemy:Update(dt: number): ()
 	if not self.isAlive then return end
-	local now      = workspace:GetServerTimeNow()
-	local markersF = workspace:FindFirstChild("EnemyMarkers")
-	local marker   = markersF and markersF:FindFirstChild(`Marker_{self.id}`)
-	self:_handleSlow(now, marker)
+	local now = workspace:GetServerTimeNow()
 	if not self:_updateMovement(now, dt) then self:Destroy() return end
-	self:_handleBleed(marker)
 end
 
--- isAlive flag prevents re-entry: Destroy can be triggered both from
--- TakeDamage (hp = 0) and _updateMovement (path end) in the same frame.
--- Visual attachments are cleaned up before model:Destroy to avoid
--- Roblox adornment warnings on destroyed instances.
+-- removes Enemy (stops animation, destroys model, removes from registry, updates enemy count in GUI)
 function Enemy:Destroy(): ()
 	if not self.isAlive then return end
 	self.isAlive = false
@@ -413,25 +371,25 @@ function Enemy:Destroy(): ()
 	updateCountLabel()
 end
 
--- Heartbeat runs three sequential phases every frame:
--- Phase 1 — FPS adaptation: update EMA, bulk-toggle shadows if threshold crossed.
--- Phase 2 — Spawn drain: instantiate up to MAX_SPAWNS_PER_FRAME enemies whose
---            spawnTime has arrived. Queue is pre-sorted so we break on the first
---            future entry — O(1) best case per frame.
--- Phase 3 — Update loop: call Update(dt) on every currently alive enemy.
+-- main loop: spawn enemies from queue, update positions and animations, manage shadows based on FPS
 RunService.Heartbeat:Connect(function(dt: number)
+	-- get current time
 	local now: number = workspace:GetServerTimeNow()
+	-- FPS smoothing
 	avgFps = avgFps * 0.9 + (1 / dt) * 0.1
-	if shadowsOn and avgFps < ClientConfig.FPS_LOW then
+	-- enable or disable shadows based on current FPS to prevent frame drops during large enemy waves
+	if shadowsOn and avgFps < FPS_LOW then
 		shadowsOn = false
 		for _, enemy in EnemyRegistry.all() do setEnemyShadows(enemy, false) end
-	elseif not shadowsOn and avgFps > ClientConfig.FPS_HIGH then
+	elseif not shadowsOn and avgFps > FPS_HIGH then
 		shadowsOn = true
 		for _, enemy in EnemyRegistry.all() do setEnemyShadows(enemy, true) end
 	end
 	local spawned: number = 0
+	-- while there are enemies in the queue and we haven't exceeded the spawn limit per frame, check the spawn time of the first enemy in the queue
 	while spawnQueueHead <= #spawnQueue and spawned < MAX_SPAWNS_PER_FRAME do
 		local entry = spawnQueue[spawnQueueHead]
+		-- if spawn time has arrived, spawn the enemy, otherwise exit the loop
 		if now >= entry.spawnTime then
 			spawnQueueHead += 1
 			if not EnemyRegistry.get(entry.id) then
@@ -439,46 +397,56 @@ RunService.Heartbeat:Connect(function(dt: number)
 				spawned += 1
 			end
 		else
+			-- queue is sorted by time, the rest haven't arrived yet
 			break
 		end
 	end
+	-- update position and animation of all enemies
 	for _, enemy in EnemyRegistry.all() do
 		enemy:Update(dt)
 	end
 end)
 
--- WaveStarted carries the wave number and authoritative server start timestamp.
--- Every client independently rebuilds the full spawn queue from the wave config
--- using the same timestamp so enemies appear in sync without extra messaging.
+-- receives wave number and wave start time from the server
 WaveStarted.OnClientEvent:Connect(function(waveNumber: number, startTime: number)
+	-- get wave config, if no config for this wave, exit
 	local waveConfig = Config.WAVES[waveNumber]
 	if not waveConfig then return end
 
+	-- remove all enemies and clear the spawn queue
 	cleanupAllEnemies()
 	waveActive      = true
+	-- prepare GUI
 	timerLabel.Text = ""
 	waveLabel.Text  = `Wave {waveNumber} / {TOTAL_WAVES}`
 
 	local spawnOffset: number = 0
 	local enemyIndex: number  = 0
+	-- iterate through enemy batches in the wave config
 	for _, batch in waveConfig do
+		-- waveConfig has non-batch keys like "boss", skip them
 		if type(batch) ~= "table" or not batch.count then continue end
+
+		-- for each enemy in the batch, calculate spawn time (wave start + spawn offset within the wave) and add to spawn queue
 		for i = 1, batch.count do
 			enemyIndex  += 1
 			local offset = spawnOffset + (i - 1) * batch.interval
+			-- add to queue
 			queueEnemy(getEnemyId(waveNumber, enemyIndex), batch.type, startTime + offset)
 		end
+
+		-- track where the next batch starts to correctly calculate the offset for the next enemy
 		spawnOffset += batch.count * batch.interval
 	end
 
+	-- boss goes last, getBossSpawnOffset calculates how late
 	if waveConfig.boss then
 		local bossOffset = getBossSpawnOffset(waveConfig)
 		queueEnemy(getBossId(waveNumber), waveConfig.boss.type, startTime + bossOffset)
 	end
 end)
 
--- AllReady fires when all connected players have clicked Ready.
--- Starts the pre-wave countdown shown in the timer label.
+-- all players ready: start countdown to the first wave
 AllReady.OnClientEvent:Connect(function()
 	startCountdown(Config.WAVE_START_DELAY, "Wave starts in: ")
 end)

@@ -82,10 +82,22 @@ type AttackCtx = {
 	beamColor  : Color3,
 }
 
+local function applyEffect(enemy: any, stats: any): ()
+	local effect = stats.effect
+	if effect == "slow" then
+		enemy:ApplySlow(1 - (stats.slowAmount or stats.slowFactor or 0), stats.slowDuration)
+	elseif effect == "stun" then
+		enemy:ApplySlow(0, stats.stunDuration)
+	elseif effect == "bleed" then
+		enemy:ApplyBleed(stats.bleedDamage, stats.bleedDuration, stats.bleedTickRate)
+	end
+end
+
 local ATTACK_SHAPES: { [string]: (AttackCtx) -> () } = {}
 
 ATTACK_SHAPES["single"] = function(ctx)
 	ctx.target:TakeDamage(ctx.stats.damage)
+	applyEffect(ctx.target, ctx.stats)
 	if not ctx.showFx then return end
 	local tHrp = ctx.target.model:FindFirstChild("HumanoidRootPart")
 	local tPos = tHrp and (tHrp :: BasePart).Position or ctx.targetPos
@@ -103,6 +115,7 @@ ATTACK_SHAPES["aoe circle"] = function(ctx)
 		if not enemy.isAlive then continue end
 		if (enemy.model:GetPivot().Position - ctx.targetPos).Magnitude <= r then
 			enemy:TakeDamage(ctx.stats.damage)
+			applyEffect(enemy, ctx.stats)
 		end
 	end
 	if not ctx.showFx then return end
@@ -118,6 +131,7 @@ ATTACK_SHAPES["full aoe"] = function(ctx)
 		if not enemy.isAlive then continue end
 		if (enemy.model:GetPivot().Position - ctx.hrp.Position).Magnitude <= ctx.stats.range then
 			enemy:TakeDamage(ctx.stats.damage)
+			applyEffect(enemy, ctx.stats)
 		end
 	end
 	if not ctx.showFx then return end
@@ -138,6 +152,7 @@ ATTACK_SHAPES["conus"] = function(ctx)
 		if toE.Magnitude <= ctx.stats.range and toE.Magnitude > 0.1
 			and atkDir:Dot(toE.Unit) >= halfCos then
 			enemy:TakeDamage(ctx.stats.damage)
+			applyEffect(enemy, ctx.stats)
 		end
 	end
 	if not ctx.showFx then return end

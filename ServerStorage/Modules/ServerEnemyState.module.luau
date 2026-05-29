@@ -145,17 +145,10 @@ function ServerEnemyState.applySlow(id: number, factor: number, duration: number
 	d.slowStart = now
 	d.wasSlowed = true
 	local startToken = d.slowStart
-	if d.marker then
-		d.marker:SetAttribute("Slowed", true)
-		d.marker:SetAttribute("SlowFactor", factor)
-	end
 	task.delay(duration, function()
 		local cur = serverEnemies[id]
 		if not cur or not cur.wasSlowed or cur.slowStart ~= startToken then return end
 		accumulateSlowDebt(cur, workspace:GetServerTimeNow())
-		if cur.marker and cur.marker.Parent then
-			cur.marker:SetAttribute("Slowed", false)
-		end
 	end)
 end
 
@@ -166,7 +159,6 @@ function ServerEnemyState.applyBleed(
 	local d = serverEnemies[id]
 	if not d or d.bleeding then return end
 	d.bleeding = true
-	if d.marker then d.marker:SetAttribute("Bleeding", true) end
 	local endTime = workspace:GetServerTimeNow() + duration
 	task.spawn(function()
 		while workspace:GetServerTimeNow() < endTime do
@@ -178,9 +170,6 @@ function ServerEnemyState.applyBleed(
 		local cur = serverEnemies[id]
 		if cur then
 			cur.bleeding = false
-			if cur.marker and cur.marker.Parent then
-				cur.marker:SetAttribute("Bleeding", false)
-			end
 		end
 	end)
 end
